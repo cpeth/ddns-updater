@@ -1,0 +1,7 @@
+GET https://api.netlify.com/api/v1/dns_zones
+Authorization: Bearer DGrrHmAaZO3JmKD2cP1AHMrakWHb98Imq8JnGKt9FvE
+
+###
+
+GET https://api.netlify.com/api/v1/dns_zones/5bea866d3813f01aa4652410/dns_records
+Authorization: Bearer DGrrHmAaZO3JmKD2cP1AHMrakWHb98Imq8JnGKt9FvE
