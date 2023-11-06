@@ -1,6 +1,7 @@
 package netlify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/qdm12/ddns-updater/internal/models"
 	"github.com/qdm12/ddns-updater/internal/provider/errors"
-	"github.com/qdm12/ddns-updater/internal/provider/headers"
 	"github.com/qdm12/ddns-updater/internal/provider/utils"
 	"github.com/qdm12/ddns-updater/pkg/publicip/ipversion"
 )
@@ -26,6 +26,7 @@ type Provider struct {
 	ipVersion ipversion.IPVersion
 	token     string
 	id        string
+	ip        netip.Addr
 }
 
 func New(data json.RawMessage, domain, host string,
@@ -94,43 +95,42 @@ func (p *Provider) HTML() models.HTMLRow {
 }
 
 func (p *Provider) Update(ctx context.Context, client *http.Client, ip netip.Addr) (newIP netip.Addr, err error) {
-	// isIPv4 := ip.Is4()
-	host := "api.netlify.com"
+	p.ip = ip
 
-	u := url.URL{
-		Scheme: "https",
-		Host:   host,
-		Path:   "/api/v1/dns_zones",
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("creating http request: %w", err)
-	}
-	headers.SetUserAgent(request)
-
-	response, err := client.Do(request)
+	err = p.getZoneID(ctx, client)
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	defer response.Body.Close()
 
-	if response.StatusCode == http.StatusOK {
-		return ip, nil
+	aRecordID, err := p.checkArecord(ctx, client)
+	if err != nil {
+		return netip.Addr{}, err
 	}
-	return netip.Addr{}, fmt.Errorf("%w: %d: %s",
-		errors.ErrHTTPStatusNotValid, response.StatusCode, utils.BodyToSingleLine(response.Body))
+
+	if aRecordID != "" {
+		err = p.deleteArecord(ctx, client, aRecordID)
+		if err != nil {
+			return netip.Addr{}, err
+		}
+	}
+
+	err = p.createArecord(ctx, client, ip)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
+	return ip, nil
 }
 
-func (p *Provider) getId(ctx context.Context, client *http.Client) error {
+func (p *Provider) getZoneID(ctx context.Context, client *http.Client) error {
 	zones := []struct {
-		Id   string `json:"id"`
+		ID   string `json:"id"`
 		Name string `json:"name"`
 	}{}
 
 	u := url.URL{
 		Scheme: "https",
-		Host:   p.host,
+		Host:   apiHost,
 		Path:   "/api/v1/dns_zones",
 	}
 
@@ -148,12 +148,129 @@ func (p *Provider) getId(ctx context.Context, client *http.Client) error {
 		return fmt.Errorf("reading response body: %w", err)
 	}
 
-	json.Unmarshal(b, &zones)
+	err = json.Unmarshal(b, &zones)
+	if err != nil {
+		return fmt.Errorf("unmarshalling response body: %w", err)
+	}
+
 	for _, zone := range zones {
 		if zone.Name == p.domain {
-			p.id = zone.Id
+			p.id = zone.ID
 			return nil
 		}
 	}
-	return fmt.Errorf("domain not found")
+	return fmt.Errorf("zone not found")
+}
+
+func (p *Provider) checkArecord(ctx context.Context, client *http.Client) (string, error) {
+	records := []struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		HostName string `json:"hostname"`
+	}{}
+
+	u := url.URL{
+		Scheme: "https",
+		Host:   p.host,
+		Path:   fmt.Sprintf("/api/v1/dns_zones/%s/dns_records", p.id),
+	}
+
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", p.token))
+	response, err := client.Do(request)
+	if err != nil {
+		return "", err
+	}
+
+	defer response.Body.Close()
+
+	b, err := io.ReadAll(response.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading response body: %w", err)
+	}
+
+	err = json.Unmarshal(b, &records)
+	if err != nil {
+		return "", fmt.Errorf("unmarshalling response body: %w", err)
+	}
+
+	recordType := "A"
+	if p.ipVersion == ipversion.IP6 {
+		recordType = "AAAA"
+	}
+
+	for _, record := range records {
+		if record.Type == recordType && record.HostName == p.host {
+			return record.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func (p *Provider) deleteArecord(ctx context.Context, client *http.Client, recordID string) error {
+
+	u := url.URL{
+		Scheme: "https",
+		Host:   apiHost,
+		Path:   fmt.Sprintf("/api/v1/dns_zones/%s/dns_records/%s", p.id, recordID),
+	}
+
+	request, _ := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", p.token))
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+
+	defer response.Body.Close()
+
+	if response.StatusCode == http.StatusNoContent {
+		return nil
+	}
+
+	return fmt.Errorf("delete A record failed. Https status not 204: %d", response.StatusCode)
+}
+
+func (p *Provider) createArecord(ctx context.Context, client *http.Client, ip netip.Addr) error {
+	recordType := "A"
+	if p.ipVersion == ipversion.IP6 {
+		recordType = "AAAA"
+	}
+
+	requestBody := struct {
+		Type     string `json:"type"`
+		Hostname string `json:"hostname"`
+		Value    string `json:"value"`
+	}{
+		Type:     recordType,
+		Hostname: apiHost,
+		Value:    ip.String(),
+	}
+
+	u := url.URL{
+		Scheme: "https",
+		Host:   p.host,
+		Path:   fmt.Sprintf("/api/v1/dns_zones/%s/dns_records", p.id),
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("error serializiong request body: %w", err)
+	}
+
+	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewBuffer(jsonData))
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", p.token))
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("error creating A record: %w", err)
+	}
+
+	defer response.Body.Close()
+
+	if response.StatusCode == http.StatusCreated {
+		return nil
+	}
+
+	return fmt.Errorf("create A record failed. Https status not 201: %d", response.StatusCode)
 }

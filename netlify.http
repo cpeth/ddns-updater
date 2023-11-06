@@ -5,3 +5,24 @@ Authorization: Bearer DGrrHmAaZO3JmKD2cP1AHMrakWHb98Imq8JnGKt9FvE
 
 GET https://api.netlify.com/api/v1/dns_zones/5bea866d3813f01aa4652410/dns_records
 Authorization: Bearer DGrrHmAaZO3JmKD2cP1AHMrakWHb98Imq8JnGKt9FvE
+
+###
+
+POST https://api.netlify.com/api/v1/dns_zones/5bea866d3813f01aa4652410/dns_records
+Authorization: Bearer DGrrHmAaZO3JmKD2cP1AHMrakWHb98Imq8JnGKt9FvE
+Content-Type: application/json
+
+{
+    "type": "A",
+    "hostname": "dev.peth.cloud",
+    "value": "108.204.120.15"
+}
+
+###
+
+    # "ttl": 3600,
+    # "priority": 0,
+    # "weight": 0,
+    # "port": 0,
+    # "flag": 0,
+    # "tag": null
